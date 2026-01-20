@@ -1,0 +1,14 @@
+bin/
+vendor/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.sum
+.env
+.env.local
+*.log
+.DS_Store
