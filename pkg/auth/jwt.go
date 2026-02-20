@@ -15,6 +15,7 @@ package auth
 
 import (
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -36,10 +37,14 @@ const (
 	bcryptCost         = bcrypt.DefaultCost
 )
 
+// RSA key size for token signing
+const rsaKeyBits = 2048
+
 var (
-	// In production, load from secure secrets manager
-	jwtSecretKey     = []byte("your-256-bit-secret-key-here-min-32-chars!")
-	refreshSecretKey = []byte("your-refresh-secret-key-also-min-32-chars!")
+	// In production, load PEM-encoded keys from secure secrets manager.
+	// These ephemeral keys are generated at startup for demo purposes only.
+	accessPrivateKey  *rsa.PrivateKey
+	refreshPrivateKey *rsa.PrivateKey
 )
 
 // Claims represents the JWT claims structure
@@ -75,10 +80,10 @@ type UserStore struct {
 	byID      map[string]*User
 }
 
-// TokenService handles all JWT operations
+// TokenService handles all JWT operations using RS256 (RSA + SHA-256)
 type TokenService struct {
-	signingKey    []byte
-	refreshKey    []byte
+	accessKey     *rsa.PrivateKey
+	refreshKey    *rsa.PrivateKey
 	accessExpiry  time.Duration
 	refreshExpiry time.Duration
 	issuer        string
@@ -131,10 +136,10 @@ func (s *UserStore) UpdateLastLogin(id string) {
 	}
 }
 
-// NewTokenService creates a TokenService with the given keys and durations
-func NewTokenService(signingKey, refreshKey []byte, accessExp, refreshExp time.Duration, issuer string) *TokenService {
+// NewTokenService creates a TokenService with the given RSA key pairs and durations
+func NewTokenService(accessKey, refreshKey *rsa.PrivateKey, accessExp, refreshExp time.Duration, issuer string) *TokenService {
 	return &TokenService{
-		signingKey:    signingKey,
+		accessKey:     accessKey,
 		refreshKey:    refreshKey,
 		accessExpiry:  accessExp,
 		refreshExpiry: refreshExp,
@@ -146,7 +151,7 @@ func NewTokenService(signingKey, refreshKey []byte, accessExp, refreshExp time.D
 func (ts *TokenService) Issue(user *User) (*TokenPair, error) {
 	now := time.Now()
 
-	accessString, err := ts.signToken(user, ts.signingKey, now, ts.accessExpiry, true)
+	accessString, err := ts.signToken(user, ts.accessKey, now, ts.accessExpiry, true)
 	if err != nil {
 		return nil, fmt.Errorf("signing access token: %w", err)
 	}
@@ -164,8 +169,8 @@ func (ts *TokenService) Issue(user *User) (*TokenPair, error) {
 	}, nil
 }
 
-// signToken builds and signs a single JWT for the user
-func (ts *TokenService) signToken(user *User, key []byte, now time.Time, expiry time.Duration, includeProfile bool) (string, error) {
+// signToken builds and signs a single JWT using RS256
+func (ts *TokenService) signToken(user *User, key *rsa.PrivateKey, now time.Time, expiry time.Duration, includeProfile bool) (string, error) {
 	claims := &Claims{
 		UserID: user.ID,
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -179,24 +184,24 @@ func (ts *TokenService) signToken(user *User, key []byte, now time.Time, expiry 
 		claims.Roles = user.Roles
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	return token.SignedString(key)
 }
 
 // ValidateAccess parses and validates an access token string
 func (ts *TokenService) ValidateAccess(tokenString string) (*Claims, error) {
-	return ts.parseToken(tokenString, ts.signingKey)
+	return ts.parseToken(tokenString, &ts.accessKey.PublicKey)
 }
 
 // ValidateRefresh parses and validates a refresh token string
 func (ts *TokenService) ValidateRefresh(tokenString string) (*Claims, error) {
-	return ts.parseToken(tokenString, ts.refreshKey)
+	return ts.parseToken(tokenString, &ts.refreshKey.PublicKey)
 }
 
-// parseToken is the shared parsing logic for both token types
-func (ts *TokenService) parseToken(tokenString string, key []byte) (*Claims, error) {
+// parseToken is the shared RS256 parsing logic for both token types
+func (ts *TokenService) parseToken(tokenString string, key *rsa.PublicKey) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return key, nil
@@ -212,13 +217,30 @@ func (ts *TokenService) parseToken(tokenString string, key []byte) (*Claims, err
 	return claims, nil
 }
 
+// PublicAccessKey returns the public key for external access token verification
+func (ts *TokenService) PublicAccessKey() *rsa.PublicKey {
+	return &ts.accessKey.PublicKey
+}
+
 // --- Package-level default instance (keeps existing routes working) ---
 
 var defaultHandler *AuthHandler
 
 func init() {
+	// Generate ephemeral RSA key pairs for demo.
+	// In production, load PEM-encoded keys from a secrets manager.
+	var err error
+	accessPrivateKey, err = rsa.GenerateKey(rand.Reader, rsaKeyBits)
+	if err != nil {
+		panic(fmt.Sprintf("failed to generate access RSA key: %v", err))
+	}
+	refreshPrivateKey, err = rsa.GenerateKey(rand.Reader, rsaKeyBits)
+	if err != nil {
+		panic(fmt.Sprintf("failed to generate refresh RSA key: %v", err))
+	}
+
 	store := NewUserStore()
-	svc := NewTokenService(jwtSecretKey, refreshSecretKey, accessTokenExpiry, refreshTokenExpiry, tokenIssuer)
+	svc := NewTokenService(accessPrivateKey, refreshPrivateKey, accessTokenExpiry, refreshTokenExpiry, tokenIssuer)
 
 	// Seed demo user
 	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("demo123"), bcryptCost)
