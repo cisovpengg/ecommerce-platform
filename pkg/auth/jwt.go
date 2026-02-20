@@ -17,6 +17,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -27,13 +28,18 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// Token configuration
+const (
+	tokenIssuer        = "ecommerce-platform"
+	accessTokenExpiry  = 15 * time.Minute
+	refreshTokenExpiry = 7 * 24 * time.Hour
+	bcryptCost         = bcrypt.DefaultCost
+)
+
 var (
 	// In production, load from secure secrets manager
 	jwtSecretKey     = []byte("your-256-bit-secret-key-here-min-32-chars!")
 	refreshSecretKey = []byte("your-refresh-secret-key-also-min-32-chars!")
-
-	tokenExpiry   = 15 * time.Minute
-	refreshExpiry = 7 * 24 * time.Hour
 )
 
 // Claims represents the JWT claims structure
@@ -59,30 +65,187 @@ type TokenPair struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	ExpiresIn    int64  `json:"expires_in"`
+	TokenType    string `json:"token_type"`
 }
 
-var (
-	users     = make(map[string]*User)
-	usersByID = make(map[string]*User)
+// UserStore manages user persistence with thread-safe access
+type UserStore struct {
 	mu        sync.RWMutex
-)
+	byEmail   map[string]*User
+	byID      map[string]*User
+}
+
+// TokenService handles all JWT operations
+type TokenService struct {
+	signingKey    []byte
+	refreshKey    []byte
+	accessExpiry  time.Duration
+	refreshExpiry time.Duration
+	issuer        string
+}
+
+// AuthHandler ties together user storage and token operations
+type AuthHandler struct {
+	users  *UserStore
+	tokens *TokenService
+}
+
+// NewUserStore creates an initialized UserStore
+func NewUserStore() *UserStore {
+	return &UserStore{
+		byEmail: make(map[string]*User),
+		byID:    make(map[string]*User),
+	}
+}
+
+// Add registers a user in both lookup maps
+func (s *UserStore) Add(u *User) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.byEmail[u.Email] = u
+	s.byID[u.ID] = u
+}
+
+// FindByEmail looks up a user by email
+func (s *UserStore) FindByEmail(email string) (*User, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u, ok := s.byEmail[email]
+	return u, ok
+}
+
+// FindByID looks up a user by ID
+func (s *UserStore) FindByID(id string) (*User, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u, ok := s.byID[id]
+	return u, ok
+}
+
+// UpdateLastLogin records the current time as the user's last login
+func (s *UserStore) UpdateLastLogin(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if u, ok := s.byID[id]; ok {
+		u.LastLogin = time.Now()
+	}
+}
+
+// NewTokenService creates a TokenService with the given keys and durations
+func NewTokenService(signingKey, refreshKey []byte, accessExp, refreshExp time.Duration, issuer string) *TokenService {
+	return &TokenService{
+		signingKey:    signingKey,
+		refreshKey:    refreshKey,
+		accessExpiry:  accessExp,
+		refreshExpiry: refreshExp,
+		issuer:        issuer,
+	}
+}
+
+// Issue creates a new access/refresh token pair for the given user
+func (ts *TokenService) Issue(user *User) (*TokenPair, error) {
+	now := time.Now()
+
+	accessString, err := ts.signToken(user, ts.signingKey, now, ts.accessExpiry, true)
+	if err != nil {
+		return nil, fmt.Errorf("signing access token: %w", err)
+	}
+
+	refreshString, err := ts.signToken(user, ts.refreshKey, now, ts.refreshExpiry, false)
+	if err != nil {
+		return nil, fmt.Errorf("signing refresh token: %w", err)
+	}
+
+	return &TokenPair{
+		AccessToken:  accessString,
+		RefreshToken: refreshString,
+		ExpiresIn:    int64(ts.accessExpiry.Seconds()),
+		TokenType:    "Bearer",
+	}, nil
+}
+
+// signToken builds and signs a single JWT for the user
+func (ts *TokenService) signToken(user *User, key []byte, now time.Time, expiry time.Duration, includeProfile bool) (string, error) {
+	claims := &Claims{
+		UserID: user.ID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(now.Add(expiry)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			Issuer:    ts.issuer,
+		},
+	}
+	if includeProfile {
+		claims.Email = user.Email
+		claims.Roles = user.Roles
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(key)
+}
+
+// ValidateAccess parses and validates an access token string
+func (ts *TokenService) ValidateAccess(tokenString string) (*Claims, error) {
+	return ts.parseToken(tokenString, ts.signingKey)
+}
+
+// ValidateRefresh parses and validates a refresh token string
+func (ts *TokenService) ValidateRefresh(tokenString string) (*Claims, error) {
+	return ts.parseToken(tokenString, ts.refreshKey)
+}
+
+// parseToken is the shared parsing logic for both token types
+func (ts *TokenService) parseToken(tokenString string, key []byte) (*Claims, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return key, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	claims, ok := token.Claims.(*Claims)
+	if !ok || !token.Valid {
+		return nil, errors.New("invalid token")
+	}
+	return claims, nil
+}
+
+// --- Package-level default instance (keeps existing routes working) ---
+
+var defaultHandler *AuthHandler
 
 func init() {
+	store := NewUserStore()
+	svc := NewTokenService(jwtSecretKey, refreshSecretKey, accessTokenExpiry, refreshTokenExpiry, tokenIssuer)
+
 	// Seed demo user
-	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("demo123"), bcrypt.DefaultCost)
-	demoUser := &User{
+	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("demo123"), bcryptCost)
+	store.Add(&User{
 		ID:           "user-demo-001",
 		Email:        "demo@example.com",
 		PasswordHash: string(hashedPassword),
 		Roles:        []string{"user"},
 		CreatedAt:    time.Now(),
-	}
-	users[demoUser.Email] = demoUser
-	usersByID[demoUser.ID] = demoUser
+	})
+
+	defaultHandler = &AuthHandler{users: store, tokens: svc}
 }
 
+// --- HTTP Handlers ---
+
 // Login authenticates a user and returns a token pair
-func Login(c *gin.Context) {
+func Login(c *gin.Context) { defaultHandler.HandleLogin(c) }
+
+// RefreshToken generates a new token pair using a valid refresh token
+func RefreshToken(c *gin.Context) { defaultHandler.HandleRefresh(c) }
+
+// VerifyToken validates an access token from the Authorization header
+func VerifyToken(c *gin.Context) { defaultHandler.HandleVerify(c) }
+
+// HandleLogin authenticates credentials and issues tokens
+func (h *AuthHandler) HandleLogin(c *gin.Context) {
 	var req struct {
 		Email    string `json:"email" binding:"required,email"`
 		Password string `json:"password" binding:"required"`
@@ -93,12 +256,9 @@ func Login(c *gin.Context) {
 		return
 	}
 
-	mu.RLock()
-	user, exists := users[req.Email]
-	mu.RUnlock()
-
+	user, exists := h.users.FindByEmail(req.Email)
 	if !exists {
-		// Use constant-time comparison to prevent timing attacks
+		// Constant-time comparison to prevent timing attacks
 		bcrypt.CompareHashAndPassword([]byte("$2a$10$dummy"), []byte(req.Password))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
@@ -109,17 +269,13 @@ func Login(c *gin.Context) {
 		return
 	}
 
-	// Generate token pair
-	tokens, err := generateTokenPair(user)
+	tokens, err := h.tokens.Issue(user)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate tokens"})
 		return
 	}
 
-	// Update last login
-	mu.Lock()
-	user.LastLogin = time.Now()
-	mu.Unlock()
+	h.users.UpdateLastLogin(user.ID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Login successful",
@@ -132,8 +288,8 @@ func Login(c *gin.Context) {
 	})
 }
 
-// RefreshToken generates a new access token using a valid refresh token
-func RefreshToken(c *gin.Context) {
+// HandleRefresh validates a refresh token and issues a new token pair
+func (h *AuthHandler) HandleRefresh(c *gin.Context) {
 	var req struct {
 		RefreshToken string `json:"refresh_token" binding:"required"`
 	}
@@ -143,36 +299,19 @@ func RefreshToken(c *gin.Context) {
 		return
 	}
 
-	// Parse and validate refresh token
-	token, err := jwt.ParseWithClaims(req.RefreshToken, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
-		return refreshSecretKey, nil
-	})
-
-	if err != nil || !token.Valid {
+	claims, err := h.tokens.ValidateRefresh(req.RefreshToken)
+	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid refresh token"})
 		return
 	}
 
-	claims, ok := token.Claims.(*Claims)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims"})
-		return
-	}
-
-	// Get user and generate new tokens
-	mu.RLock()
-	user, exists := usersByID[claims.UserID]
-	mu.RUnlock()
-
+	user, exists := h.users.FindByID(claims.UserID)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
 	}
 
-	tokens, err := generateTokenPair(user)
+	tokens, err := h.tokens.Issue(user)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate tokens"})
 		return
@@ -181,22 +320,15 @@ func RefreshToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"tokens": tokens})
 }
 
-// VerifyToken validates an access token
-func VerifyToken(c *gin.Context) {
-	authHeader := c.GetHeader("Authorization")
-	if authHeader == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
+// HandleVerify validates an access token and returns the embedded claims
+func (h *AuthHandler) HandleVerify(c *gin.Context) {
+	tokenString, err := extractBearerToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
-	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 || parts[0] != "Bearer" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid authorization format"})
-		return
-	}
-
-	tokenString := parts[1]
-	claims, err := validateAccessToken(tokenString)
+	claims, err := h.tokens.ValidateAccess(tokenString)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
 		return
@@ -211,70 +343,18 @@ func VerifyToken(c *gin.Context) {
 	})
 }
 
-// generateTokenPair creates new access and refresh tokens
-func generateTokenPair(user *User) (*TokenPair, error) {
-	now := time.Now()
-
-	// Access token
-	accessClaims := &Claims{
-		UserID: user.ID,
-		Email:  user.Email,
-		Roles:  user.Roles,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(now.Add(tokenExpiry)),
-			IssuedAt:  jwt.NewNumericDate(now),
-			Issuer:    "ecommerce-platform",
-		},
+// extractBearerToken pulls the token string from the Authorization header
+func extractBearerToken(c *gin.Context) (string, error) {
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		return "", errors.New("Authorization header required")
 	}
 
-	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
-	accessString, err := accessToken.SignedString(jwtSecretKey)
-	if err != nil {
-		return nil, err
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		return "", errors.New("Invalid authorization format")
 	}
-
-	// Refresh token
-	refreshClaims := &Claims{
-		UserID: user.ID,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(now.Add(refreshExpiry)),
-			IssuedAt:  jwt.NewNumericDate(now),
-			Issuer:    "ecommerce-platform",
-		},
-	}
-
-	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims)
-	refreshString, err := refreshToken.SignedString(refreshSecretKey)
-	if err != nil {
-		return nil, err
-	}
-
-	return &TokenPair{
-		AccessToken:  accessString,
-		RefreshToken: refreshString,
-		ExpiresIn:    int64(tokenExpiry.Seconds()),
-	}, nil
-}
-
-// validateAccessToken parses and validates an access token
-func validateAccessToken(tokenString string) (*Claims, error) {
-	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
-		return jwtSecretKey, nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	claims, ok := token.Claims.(*Claims)
-	if !ok || !token.Valid {
-		return nil, errors.New("invalid token")
-	}
-
-	return claims, nil
+	return parts[1], nil
 }
 
 // GenerateSecureToken creates a cryptographically secure random token
